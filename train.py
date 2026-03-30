@@ -19,10 +19,13 @@ def set_seed(seed):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="data", help="Path to dataset")
+    parser.add_argument("--data_dir", type=str, default="data/Crop Diseases/Crop___Disease", help="Path to dataset")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--model", type=str, default="all", help="Model to run or 'all' for all models")
-    parser.add_argument("--seed", type=str, default="all", help="Specific seed to run, e.g., '42', or 'all'")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
+    parser.add_argument("--dummy", action="store_true", help="Run a dummy test without real data")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
+    parser.add_argument("--max_per_class", type=int, default=None, help="Max images per class (default: use all images)")
     args = parser.parse_args()
 
     available_models = ["ResNet50", "EfficientNetB0", "MobileNetV2", "ViT", "SwinTiny", "CvT"]
@@ -33,13 +36,32 @@ def main():
             raise ValueError(f"Model must be 'all' or one of {available_models}")
         models_to_run = [args.model]
 
-    if args.seed == "all":
-        seeds = [42, 123, 456]
-    else:
-        seeds = [int(args.seed)]
+    seeds = [args.seed]
         
-    img_size = 128
-    num_classes = 5
+    img_size = 224
+    
+    def get_classes_from_dir(base_dir):
+        classes = []
+        if not os.path.exists(base_dir):
+            return None
+        for item in os.listdir(base_dir):
+            item_path = os.path.join(base_dir, item)
+            if os.path.isdir(item_path):
+                subdirs = [d for d in os.listdir(item_path) if os.path.isdir(os.path.join(item_path, d))]
+                if subdirs:
+                    for sub in subdirs:
+                        classes.append(os.path.join(item, sub))
+                else:
+                    classes.append(item)
+        return sorted(classes) if classes else None
+
+    if args.dummy:
+        num_classes = 17
+        classes = None
+        # Add support for dummy flag
+    else:
+        classes = get_classes_from_dir(args.data_dir)
+        num_classes = len(classes) if classes else 17
 
     os.makedirs("results", exist_ok=True)
     all_results = {}
@@ -50,21 +72,27 @@ def main():
             print(f"\\n{'='*50}\\nRunning {model_name} with seed {seed}\\n{'='*50}\\n")
             set_seed(seed)
 
+            # Create model-specific results folder
+            model_save_dir = os.path.join("results", model_name)
+            os.makedirs(model_save_dir, exist_ok=True)
+
             # Build Model
             input_shape = (img_size, img_size, 3)
             model = get_model(model_name, input_shape, num_classes)
             
-            optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+            optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-4)
             model.compile(optimizer=optimizer, loss="categorical_crossentropy", metrics=["accuracy"])
 
             # Data Loading
             if args.dummy:
-                train_gen, val_gen, steps_per_epoch = get_dummy_dataset(img_size, args.batch_size, num_classes)
+                train_gen, val_gen, test_gen, steps_per_epoch = get_dummy_dataset(img_size, args.batch_size, num_classes)
                 val_steps = 2
+                test_steps = 2
             else:
-                train_gen, val_gen = get_data_generators(args.data_dir, args.batch_size, img_size)
+                train_gen, val_gen, test_gen = get_data_generators(args.data_dir, args.batch_size, img_size, classes=classes, max_per_class=args.max_per_class)
                 steps_per_epoch = train_gen.samples // args.batch_size
                 val_steps = val_gen.samples // args.batch_size
+                test_steps = test_gen.samples // args.batch_size
 
             # Computational Cost
             params = model.count_params()
@@ -85,14 +113,14 @@ def main():
             # Standard Evaluation
             start_infer = time.time()
             if args.dummy:
-                dummy_x, dummy_y = next(iter(val_gen))
+                dummy_x, dummy_y = next(iter(test_gen))
                 y_pred_probs = model.predict(dummy_x)
                 y_true = np.argmax(dummy_y, axis=1)
                 test_images = dummy_x[:1]
             else:
-                y_pred_probs = model.predict(val_gen)
-                y_true = val_gen.classes
-                test_images, _ = next(iter(val_gen))
+                y_pred_probs = model.predict(test_gen)
+                y_true = test_gen.classes
+                test_images, _ = next(iter(test_gen))
             
             infer_time = time.time() - start_infer
             y_pred = np.argmax(y_pred_probs, axis=1)
@@ -103,22 +131,36 @@ def main():
 
             metrics = calculate_metrics(y_true, y_pred)
             
+            print(f"\nTest Metrics ({model_name}, Seed {seed}):")
+            print(f"  Accuracy:  {metrics['accuracy']:.4f}")
+            print(f"  Precision: {metrics['precision']:.4f}")
+            print(f"  Recall:    {metrics['recall']:.4f}")
+            print(f"  F1 Score:  {metrics['f1_score']:.4f}\n")
+
             try:
-                generate_explainability(model, test_images, model_name, seed, save_dir="results")
-                plot_history(history.history, model_name, seed, save_dir="results")
+                if args.dummy:
+                    class_names = [f"Class_{i}" for i in range(num_classes)]
+                else:
+                    class_names = list(test_gen.class_indices.keys())
+
+                if not args.dummy:
+                    plot_confusion_matrix(y_true, y_pred, class_names, model_name, seed, save_dir=model_save_dir)
+                    generate_explainability(model, test_gen, model_name, seed, save_dir="results")
+                plot_history(history.history, model_name, seed, save_dir=model_save_dir)
             except Exception as e:
                 print(f"Explainability/Plotting failed for {model_name} (Seed {seed}): {e}")
+                class_names = []
 
             # Robustness Eval (dummy only tests code path)
             robustness_results = {}
             for corruption in ["noise", "blur", "lighting"]:
                 if args.dummy:
-                    rob_gen = val_gen
+                    rob_gen = test_gen
                 else:
-                    _, rob_gen = get_data_generators(args.data_dir, args.batch_size, img_size, corruption_type=corruption)
+                    _, _, rob_gen = get_data_generators(args.data_dir, args.batch_size, img_size, classes=classes, max_per_class=args.max_per_class, corruption_type=corruption)
                 
                 try:
-                    score = model.evaluate(rob_gen, steps=val_steps, verbose=0)
+                    score = model.evaluate(rob_gen, steps=test_steps, verbose=0)
                     robustness_results[corruption] = score[1] # accuracy
                 except Exception:
                     robustness_results[corruption] = 0.0
@@ -129,11 +171,12 @@ def main():
                 "train_time_s": train_time,
                 "infer_time_s": infer_time,
                 "metrics": metrics,
+                "class_names": class_names,
                 "robustness_accuracy": robustness_results
             }
             
             # Save model-specific results for this seed
-            with open(os.path.join("results", f"benchmark_results_{model_name}_seed{seed}.json"), "w") as f:
+            with open(os.path.join(model_save_dir, f"benchmark_results_seed{seed}.json"), "w") as f:
                 json.dump({model_name: all_results[model_name]}, f, indent=4)
 
             # Clear session to avoid memory leak

@@ -49,38 +49,39 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None
         if size * size == heatmap.shape[0]:
             heatmap = tf.reshape(heatmap, (size, size))
         else:
-            # Fallback if it can't be perfectly squared (e.g. includes CLS token)
-            # Remove CLS if present (just an example, our ViT doesn't use CLS token)
             pass 
 
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
     return heatmap.numpy()
 
-def save_and_display_gradcam(img_array, heatmap, save_path, alpha=0.4):
-    img = np.array(img_array[0]) * 255.0
+def overlay_heatmap(img_array, heatmap, alpha=0.4):
+    """Create a superimposed image of heatmap over original image."""
+    img = np.array(img_array) * 255.0
     img = img.astype(np.uint8)
 
-    heatmap = np.uint8(255 * heatmap)
+    heatmap_uint8 = np.uint8(255 * heatmap)
     
-    if len(heatmap.shape) == 2:
-        heatmap = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+    if len(heatmap_uint8.shape) == 2:
+        heatmap_uint8 = cv2.resize(heatmap_uint8, (img.shape[1], img.shape[0]))
     
-    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
     
-    superimposed_img = heatmap * alpha + img
-    superimposed_img = np.clip(superimposed_img, 0, 255).astype(np.uint8)
+    superimposed = heatmap_colored * alpha + img
+    superimposed = np.clip(superimposed, 0, 255).astype(np.uint8)
+    return superimposed
 
-    plt.figure(figsize=(6, 6))
-    plt.imshow(superimposed_img)
-    plt.axis('off')
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-def generate_explainability(model, img_array, model_name, seed, save_dir="results"):
-    os.makedirs(save_dir, exist_ok=True)
+def generate_explainability(model, test_gen, model_name, seed, save_dir="results", images_per_class=5):
+    """
+    Generate GradCAM/Attention overlays for multiple images per class.
+    Picks up to `images_per_class` images from each class in the test generator.
+    Saves overlays organized by class under save_dir/model_name/.
+    """
+    model_dir = os.path.join(save_dir, model_name)
+    explainability_dir = os.path.join(model_dir, f"seed{seed}_explainability")
+    os.makedirs(explainability_dir, exist_ok=True)
     
+    # Determine the right layer
     if "ResNet" in model_name or "EfficientNet" in model_name or "MobileNet" in model_name:
         layer_name = get_last_conv_layer_name(model)
         prefix = "GradCAM"
@@ -92,6 +93,71 @@ def generate_explainability(model, img_array, model_name, seed, save_dir="result
         print(f"Could not find a suitable layer for explainability in {model_name}.")
         return
 
-    heatmap = make_gradcam_heatmap(img_array, model, layer_name)
-    save_path = os.path.join(save_dir, f"{model_name}_seed{seed}_{prefix}.png")
-    save_and_display_gradcam(img_array, heatmap, save_path)
+    # Get class names from the generator
+    class_indices = test_gen.class_indices  # {'Corn/Corn___Common_Rust': 0, ...}
+    idx_to_class = {v: k for k, v in class_indices.items()}
+    num_classes = len(class_indices)
+    
+    # Collect images per class
+    class_images = {i: [] for i in range(num_classes)}
+    
+    # Iterate through the test generator to collect images
+    steps = len(test_gen)
+    for step_idx in range(min(steps, steps)):
+        batch_images, batch_labels = test_gen[step_idx]
+        batch_class_indices = np.argmax(batch_labels, axis=1)
+        
+        for i in range(len(batch_images)):
+            cls_idx = batch_class_indices[i]
+            if len(class_images[cls_idx]) < images_per_class:
+                class_images[cls_idx].append(batch_images[i])
+        
+        # Check if all classes have enough images
+        if all(len(v) >= images_per_class for v in class_images.values()):
+            break
+    
+    # Generate overlays for each class
+    for cls_idx, images in class_images.items():
+        if not images:
+            continue
+            
+        class_name = idx_to_class.get(cls_idx, f"class_{cls_idx}")
+        # Clean up class name for folder (replace / with _)
+        clean_class_name = class_name.replace("/", "_").replace(" ", "_")
+        class_dir = os.path.join(explainability_dir, clean_class_name)
+        os.makedirs(class_dir, exist_ok=True)
+        
+        for img_idx, img in enumerate(images):
+            try:
+                img_batch = np.expand_dims(img, axis=0)
+                heatmap = make_gradcam_heatmap(img_batch, model, layer_name)
+                overlay = overlay_heatmap(img, heatmap)
+                
+                # Save overlay
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                
+                # Original image
+                axes[0].imshow((img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8))
+                axes[0].set_title("Original")
+                axes[0].axis("off")
+                
+                # Heatmap
+                axes[1].imshow(heatmap, cmap="jet")
+                axes[1].set_title(f"{prefix} Heatmap")
+                axes[1].axis("off")
+                
+                # Overlay
+                axes[2].imshow(overlay)
+                axes[2].set_title(f"{prefix} Overlay")
+                axes[2].axis("off")
+                
+                plt.suptitle(f"{model_name} | {class_name} | Image {img_idx+1}", fontsize=12)
+                plt.tight_layout()
+                save_path = os.path.join(class_dir, f"{prefix}_img{img_idx+1}.png")
+                plt.savefig(save_path, dpi=150)
+                plt.close()
+                
+            except Exception as e:
+                print(f"  Failed for {class_name} image {img_idx+1}: {e}")
+    
+    print(f"Explainability maps saved to: {explainability_dir}")
