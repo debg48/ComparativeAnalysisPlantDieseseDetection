@@ -76,9 +76,15 @@ def get_data_generators(data_path, batch_size, img_size, classes=None, max_per_c
     if corruption_type is None:
         train_datagen = ImageDataGenerator(
             rescale=1./255,
-            rotation_range=30,
+            rotation_range=40,
+            width_shift_range=0.2,
+            height_shift_range=0.2,
             zoom_range=0.3,
-            horizontal_flip=True
+            horizontal_flip=True,
+            vertical_flip=True,
+            brightness_range=[0.8, 1.2],
+            shear_range=0.15,
+            fill_mode='reflect'
         )
         val_test_datagen = ImageDataGenerator(rescale=1./255)
     else:

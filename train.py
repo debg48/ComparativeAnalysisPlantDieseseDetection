@@ -11,6 +11,7 @@ from models import get_model
 from data_loader import get_data_generators, get_dummy_dataset
 from metrics_utils import get_flops, plot_history, plot_confusion_matrix, calculate_metrics
 from explainability import generate_explainability
+from sklearn.utils.class_weight import compute_class_weight
 
 def set_seed(seed):
     random.seed(seed)
@@ -81,7 +82,7 @@ def main():
             model = get_model(model_name, input_shape, num_classes)
             
             optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-4)
-            model.compile(optimizer=optimizer, loss="categorical_crossentropy", metrics=["accuracy"])
+            model.compile(optimizer=optimizer, loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1), metrics=["accuracy"])
 
             # Data Loading
             if args.dummy:
@@ -98,6 +99,27 @@ def main():
             params = model.count_params()
             flops = get_flops(model)
             
+            # Compute class weights for handling imbalance
+            if args.dummy:
+                class_weight_dict = None
+            else:
+                class_weights = compute_class_weight(
+                    'balanced',
+                    classes=np.unique(train_gen.classes),
+                    y=train_gen.classes
+                )
+                class_weight_dict = dict(enumerate(class_weights))
+
+            # Callbacks
+            callbacks = [
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6, verbose=1
+                ),
+                tf.keras.callbacks.EarlyStopping(
+                    monitor='val_loss', patience=7, restore_best_weights=True, verbose=1
+                )
+            ]
+
             # Train model
             start_train = time.time()
             history = model.fit(
@@ -106,6 +128,8 @@ def main():
                 epochs=args.epochs,
                 steps_per_epoch=steps_per_epoch,
                 validation_steps=val_steps,
+                callbacks=callbacks,
+                class_weight=class_weight_dict,
                 verbose=1
             )
             train_time = time.time() - start_train

@@ -5,29 +5,68 @@ import cv2
 import os
 
 def get_last_conv_layer_name(model):
-    for layer in reversed(model.layers):
+    inner_model = next((layer for layer in model.layers if isinstance(layer, tf.keras.Model)), None)
+    target_model = inner_model if inner_model else model
+    for layer in reversed(target_model.layers):
         if isinstance(layer, tf.keras.layers.Conv2D):
             return layer.name
     return None
 
 def get_last_spatial_layer_name(model):
     # For transformers, look for the last LayerNormalization before GlobalAveragePooling
-    for layer in reversed(model.layers):
+    inner_model = next((layer for layer in model.layers if isinstance(layer, tf.keras.Model)), None)
+    target_model = inner_model if inner_model else model
+    for layer in reversed(target_model.layers):
         if isinstance(layer, (tf.keras.layers.Conv2D, tf.keras.layers.LayerNormalization, tf.keras.layers.Add)):
             if len(layer.output_shape) == 4 or len(layer.output_shape) == 3:
                 return layer.name
     return None
 
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None):
-    grad_model = tf.keras.models.Model(
-        [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
-    )
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None, crop_array=None):
+    inner_model = next((layer for layer in model.layers if isinstance(layer, tf.keras.Model)), None)
+    
+    if inner_model is not None and crop_array is not None:
+        # Dual input case
+        target_layer_output = inner_model.get_layer(last_conv_layer_name).output
+        grad_inner_model = tf.keras.Model(inner_model.inputs, [target_layer_output, inner_model.output])
+        
+        image_input = model.get_layer("image_input").input
+        crop_input = model.get_layer("crop_input").input
+        target_out, img_features = grad_inner_model(image_input)
+        
+        crop_dense = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dense) and l.units == 128)
+        crop_ln = next(l for l in model.layers if isinstance(l, tf.keras.layers.LayerNormalization))
+        concat_layer = next(l for l in model.layers if isinstance(l, tf.keras.layers.Concatenate))
+        merged_dense = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dense) and l.units == 256)
+        dropout_layer = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dropout))
+        output_dense = model.get_layer("disease_output")
+        
+        x_crop = crop_dense(crop_input)
+        x_crop = crop_ln(x_crop)
+        merged = concat_layer([img_features, x_crop])
+        x = merged_dense(merged)
+        x = dropout_layer(x)
+        preds = output_dense(x)
+        
+        grad_model = tf.keras.Model(inputs=[image_input, crop_input], outputs=[target_out, preds])
+        
+        with tf.GradientTape() as tape:
+            last_conv_layer_output, preds = grad_model([img_array, crop_array])
+            if pred_index is None:
+                pred_index = tf.argmax(preds[0])
+            class_channel = preds[:, pred_index]
 
-    with tf.GradientTape() as tape:
-        last_conv_layer_output, preds = grad_model(img_array)
-        if pred_index is None:
-            pred_index = tf.argmax(preds[0])
-        class_channel = preds[:, pred_index]
+    else:
+        # Standard case
+        grad_model = tf.keras.models.Model(
+            [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
+        )
+        
+        with tf.GradientTape() as tape:
+            last_conv_layer_output, preds = grad_model(img_array)
+            if pred_index is None:
+                pred_index = tf.argmax(preds[0])
+            class_channel = preds[:, pred_index]
 
     grads = tape.gradient(class_channel, last_conv_layer_output)
     
@@ -103,14 +142,25 @@ def generate_explainability(model, test_gen, model_name, seed, save_dir="results
     
     # Iterate through the test generator to collect images
     steps = len(test_gen)
-    for step_idx in range(min(steps, steps)):
-        batch_images, batch_labels = test_gen[step_idx]
+    for step_idx in range(steps):
+        batch_data, batch_labels = test_gen[step_idx]
         batch_class_indices = np.argmax(batch_labels, axis=1)
         
-        for i in range(len(batch_images)):
+        is_dual_input = isinstance(batch_data, tuple)
+        if is_dual_input:
+            batch_imgs = batch_data[0]
+            batch_crops = batch_data[1]
+        else:
+            batch_imgs = batch_data
+            batch_crops = None
+            
+        for i in range(len(batch_imgs)):
             cls_idx = batch_class_indices[i]
             if len(class_images[cls_idx]) < images_per_class:
-                class_images[cls_idx].append(batch_images[i])
+                if is_dual_input:
+                    class_images[cls_idx].append((batch_imgs[i], batch_crops[i]))
+                else:
+                    class_images[cls_idx].append(batch_imgs[i])
         
         # Check if all classes have enough images
         if all(len(v) >= images_per_class for v in class_images.values()):
@@ -127,10 +177,18 @@ def generate_explainability(model, test_gen, model_name, seed, save_dir="results
         class_dir = os.path.join(explainability_dir, clean_class_name)
         os.makedirs(class_dir, exist_ok=True)
         
-        for img_idx, img in enumerate(images):
+        for item_idx, item in enumerate(images):
             try:
-                img_batch = np.expand_dims(img, axis=0)
-                heatmap = make_gradcam_heatmap(img_batch, model, layer_name)
+                if is_dual_input:
+                    img, crop = item
+                    img_batch = np.expand_dims(img, axis=0)
+                    crop_batch = np.expand_dims(crop, axis=0)
+                else:
+                    img = item
+                    img_batch = np.expand_dims(img, axis=0)
+                    crop_batch = None
+                    
+                heatmap = make_gradcam_heatmap(img_batch, model, layer_name, crop_array=crop_batch)
                 overlay = overlay_heatmap(img, heatmap)
                 
                 # Save overlay
@@ -151,13 +209,13 @@ def generate_explainability(model, test_gen, model_name, seed, save_dir="results
                 axes[2].set_title(f"{prefix} Overlay")
                 axes[2].axis("off")
                 
-                plt.suptitle(f"{model_name} | {class_name} | Image {img_idx+1}", fontsize=12)
+                plt.suptitle(f"{model_name} | {class_name} | Image {item_idx+1}", fontsize=12)
                 plt.tight_layout()
-                save_path = os.path.join(class_dir, f"{prefix}_img{img_idx+1}.png")
+                save_path = os.path.join(class_dir, f"{prefix}_img{item_idx+1}.png")
                 plt.savefig(save_path, dpi=150)
                 plt.close()
                 
             except Exception as e:
-                print(f"  Failed for {class_name} image {img_idx+1}: {e}")
+                print(f"  Failed for {class_name} image {item_idx+1}: {e}")
     
     print(f"Explainability maps saved to: {explainability_dir}")

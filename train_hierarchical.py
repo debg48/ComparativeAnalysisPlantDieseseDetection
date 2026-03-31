@@ -14,6 +14,7 @@ from hierarchical_data_loader import (
 )
 from metrics_utils import get_flops, plot_history, plot_confusion_matrix, calculate_metrics
 from explainability import generate_explainability
+from sklearn.utils.class_weight import compute_class_weight
 
 
 def set_seed(seed):
@@ -22,7 +23,7 @@ def set_seed(seed):
     tf.random.set_seed(seed)
 
 
-def train_and_evaluate(model, train_gen, val_gen, test_gen, epochs, batch_size, model_name_tag, verbose=1):
+def train_and_evaluate(model, train_gen, val_gen, test_gen, epochs, batch_size, model_name_tag, callbacks=None, class_weight=None, verbose=1):
     """Train a model and return metrics + timing."""
     steps_per_epoch = max(1, train_gen.samples // batch_size)
     val_steps = max(1, val_gen.samples // batch_size)
@@ -40,6 +41,8 @@ def train_and_evaluate(model, train_gen, val_gen, test_gen, epochs, batch_size, 
         epochs=epochs,
         steps_per_epoch=steps_per_epoch,
         validation_steps=val_steps,
+        callbacks=callbacks,
+        class_weight=class_weight,
         verbose=verbose
     )
     train_time = time.time() - start_train
@@ -139,8 +142,15 @@ def end_to_end_evaluate(crop_model, phase2_model, test_df, data_path,
         pred_crop_onehot = np.zeros((1, len(crop_idx_to_name)))
         pred_crop_onehot[0, pred_crop_idx] = 1.0
 
-        disease_pred_probs = phase2_model.predict([img, pred_crop_onehot], verbose=0)
-        pred_disease_local_idx = np.argmax(disease_pred_probs[0])
+        disease_pred_probs = phase2_model.predict([img, pred_crop_onehot], verbose=0)[0]
+        
+        # Mask probabilities to enforce hierarchical constraint
+        valid_diseases = set(crop_to_diseases[pred_crop_name])
+        for idx, d_name in enumerate(phase2_model._specialist_classes):
+            if d_name not in valid_diseases:
+                disease_pred_probs[idx] = 0.0
+                
+        pred_disease_local_idx = np.argmax(disease_pred_probs)
         pred_disease_name = phase2_model._specialist_classes[pred_disease_local_idx]
 
         # Map back to global disease index
@@ -250,11 +260,30 @@ def main():
         input_shape = (img_size, img_size, 3)
         crop_model = get_model(args.model, input_shape, num_crops)
         optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-4)
-        crop_model.compile(optimizer=optimizer, loss="categorical_crossentropy", metrics=["accuracy"])
+        crop_model.compile(optimizer=optimizer, loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1), metrics=["accuracy"])
+
+        # Compute class weights for Phase 1
+        p1_class_weights = compute_class_weight(
+            'balanced',
+            classes=np.unique(crop_train_gen.classes),
+            y=crop_train_gen.classes
+        )
+        p1_class_weight_dict = dict(enumerate(p1_class_weights))
+
+        # Phase 1 callbacks
+        p1_callbacks = [
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6, verbose=1
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss', patience=7, restore_best_weights=True, verbose=1
+            )
+        ]
 
         crop_results = train_and_evaluate(
             crop_model, crop_train_gen, crop_val_gen, crop_test_gen,
-            args.p1_epochs, args.batch_size, f"Phase1_CropRouter"
+            args.p1_epochs, args.batch_size, f"Phase1_CropRouter",
+            callbacks=p1_callbacks, class_weight=p1_class_weight_dict
         )
 
         # Save Phase 1 plots
@@ -302,11 +331,30 @@ def main():
 
         phase2_model = get_dual_input_model(args.model, input_shape, num_crops, len(all_classes))
         optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-4)
-        phase2_model.compile(optimizer=optimizer, loss="categorical_crossentropy", metrics=["accuracy"])
+        phase2_model.compile(optimizer=optimizer, loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1), metrics=["accuracy"])
+
+        # Compute class weights for Phase 2
+        p2_class_weights = compute_class_weight(
+            'balanced',
+            classes=np.unique(disease_train.classes),
+            y=disease_train.classes
+        )
+        p2_class_weight_dict = dict(enumerate(p2_class_weights))
+
+        # Phase 2 callbacks
+        p2_callbacks = [
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6, verbose=1
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss', patience=7, restore_best_weights=True, verbose=1
+            )
+        ]
 
         spec_results = train_and_evaluate(
             phase2_model, disease_train, disease_val, disease_test,
-            args.p2_epochs, args.batch_size, f"Phase2_JointSpecialist"
+            args.p2_epochs, args.batch_size, f"Phase2_JointSpecialist",
+            callbacks=p2_callbacks, class_weight=p2_class_weight_dict
         )
 
         # Store class mapping on the model for end-to-end eval
