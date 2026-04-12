@@ -14,7 +14,6 @@ from hierarchical_data_loader import (
 )
 from metrics_utils import get_flops, plot_history, plot_confusion_matrix, calculate_metrics
 from explainability import generate_explainability
-from sklearn.utils.class_weight import compute_class_weight
 
 
 def set_seed(seed):
@@ -23,7 +22,7 @@ def set_seed(seed):
     tf.random.set_seed(seed)
 
 
-def train_and_evaluate(model, train_gen, val_gen, test_gen, epochs, batch_size, model_name_tag, callbacks=None, class_weight=None, verbose=1):
+def train_and_evaluate(model, train_gen, val_gen, test_gen, epochs, batch_size, model_name_tag, callbacks=None, verbose=1):
     """Train a model and return metrics + timing."""
     steps_per_epoch = max(1, train_gen.samples // batch_size)
     val_steps = max(1, val_gen.samples // batch_size)
@@ -42,7 +41,6 @@ def train_and_evaluate(model, train_gen, val_gen, test_gen, epochs, batch_size, 
         steps_per_epoch=steps_per_epoch,
         validation_steps=val_steps,
         callbacks=callbacks,
-        class_weight=class_weight,
         verbose=verbose
     )
     train_time = time.time() - start_train
@@ -199,14 +197,14 @@ def end_to_end_evaluate(crop_model, phase2_model, test_df, data_path,
 def main():
     parser = argparse.ArgumentParser(description="Two-Stage Hierarchical Crop Disease Classifier")
     parser.add_argument("--data_dir", type=str, default="data/Crop Diseases/Crop___Disease", help="Path to dataset")
-    parser.add_argument("--p1_epochs", type=int, default=10, help="Number of training epochs for Phase 1")
+    parser.add_argument("--p1_epochs", type=int, default=15, help="Number of training epochs for Phase 1")
     parser.add_argument("--p2_epochs", type=int, default=20, help="Number of training epochs for Phase 2")
     parser.add_argument("--model", type=str, default="CvT", help="Model architecture to use")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     args = parser.parse_args()
 
-    available_models = ["ResNet50", "EfficientNetB0", "MobileNetV2", "ViT", "SwinTiny", "CvT"]
+    available_models = ["ResNet50", "EfficientNetB0", "MobileNetV2", "ViT", "SwinTiny", "CvT", "Conformer"]
     if args.model not in available_models:
         raise ValueError(f"Model must be one of {available_models}")
 
@@ -258,17 +256,15 @@ def main():
         )
 
         input_shape = (img_size, img_size, 3)
-        crop_model = get_model(args.model, input_shape, num_crops)
+        if args.model in ["CvT", "Conformer"]:
+            # Phase 1: Use CNN router for high routing accuracy on the simple 5-class crop task
+            from models import get_cnn_router
+            crop_model = get_cnn_router(input_shape, num_crops)
+        else:
+            crop_model = get_model(args.model, input_shape, num_crops)
+        
         optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-4)
-        crop_model.compile(optimizer=optimizer, loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1), metrics=["accuracy"])
-
-        # Compute class weights for Phase 1
-        p1_class_weights = compute_class_weight(
-            'balanced',
-            classes=np.unique(crop_train_gen.classes),
-            y=crop_train_gen.classes
-        )
-        p1_class_weight_dict = dict(enumerate(p1_class_weights))
+        crop_model.compile(optimizer=optimizer, loss="categorical_crossentropy", metrics=["accuracy"])
 
         # Phase 1 callbacks
         p1_callbacks = [
@@ -283,13 +279,15 @@ def main():
         crop_results = train_and_evaluate(
             crop_model, crop_train_gen, crop_val_gen, crop_test_gen,
             args.p1_epochs, args.batch_size, f"Phase1_CropRouter",
-            callbacks=p1_callbacks, class_weight=p1_class_weight_dict
+            callbacks=p1_callbacks
         )
 
-        # Save Phase 1 plots
+        # Save Phase 1 plots and model
         phase1_dir = os.path.join(seed_dir, "phase1_crop_router")
         os.makedirs(phase1_dir, exist_ok=True)
         plot_history(crop_results["history"], f"{args.model}_CropRouter", seed, save_dir=phase1_dir)
+        crop_model.save(os.path.join(phase1_dir, "crop_router_model.h5"))
+        print(f"  Phase 1 model saved to: {phase1_dir}/crop_router_model.h5")
 
         crop_class_names = list(crop_test_gen.class_indices.keys())
         
@@ -331,15 +329,7 @@ def main():
 
         phase2_model = get_dual_input_model(args.model, input_shape, num_crops, len(all_classes))
         optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-4)
-        phase2_model.compile(optimizer=optimizer, loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1), metrics=["accuracy"])
-
-        # Compute class weights for Phase 2
-        p2_class_weights = compute_class_weight(
-            'balanced',
-            classes=np.unique(disease_train.classes),
-            y=disease_train.classes
-        )
-        p2_class_weight_dict = dict(enumerate(p2_class_weights))
+        phase2_model.compile(optimizer=optimizer, loss="categorical_crossentropy", metrics=["accuracy"])
 
         # Phase 2 callbacks
         p2_callbacks = [
@@ -354,16 +344,18 @@ def main():
         spec_results = train_and_evaluate(
             phase2_model, disease_train, disease_val, disease_test,
             args.p2_epochs, args.batch_size, f"Phase2_JointSpecialist",
-            callbacks=p2_callbacks, class_weight=p2_class_weight_dict
+            callbacks=p2_callbacks
         )
 
         # Store class mapping on the model for end-to-end eval
         phase2_model._specialist_classes = all_classes
 
-        # Save Phase 2 plots
+        # Save Phase 2 plots and model
         phase2_dir = os.path.join(seed_dir, "phase2_joint_specialist")
         os.makedirs(phase2_dir, exist_ok=True)
         plot_history(spec_results["history"], f"{args.model}_JointSpecialist", seed, save_dir=phase2_dir)
+        phase2_model.save(os.path.join(phase2_dir, "joint_specialist_model.h5"))
+        print(f"  Phase 2 model saved to: {phase2_dir}/joint_specialist_model.h5")
 
         m = spec_results["metrics"]
         print(f"\nPhase 2 (Joint Specialist) Metrics (Seed {seed}):")

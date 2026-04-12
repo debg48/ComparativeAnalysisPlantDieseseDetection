@@ -27,26 +27,85 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None
     
     if inner_model is not None and crop_array is not None:
         # Dual input case
+        is_conformer = "Conformer" in model.name
+        
         target_layer_output = inner_model.get_layer(last_conv_layer_name).output
         grad_inner_model = tf.keras.Model(inner_model.inputs, [target_layer_output, inner_model.output])
         
         image_input = model.get_layer("image_input").input
         crop_input = model.get_layer("crop_input").input
-        target_out, img_features = grad_inner_model(image_input)
+        target_tuple = grad_inner_model(image_input)
         
-        crop_dense = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dense) and l.units == 128)
-        crop_ln = next(l for l in model.layers if isinstance(l, tf.keras.layers.LayerNormalization))
-        concat_layer = next(l for l in model.layers if isinstance(l, tf.keras.layers.Concatenate))
-        merged_dense = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dense) and l.units == 256)
-        dropout_layer = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dropout))
-        output_dense = model.get_layer("disease_output")
-        
-        x_crop = crop_dense(crop_input)
-        x_crop = crop_ln(x_crop)
-        merged = concat_layer([img_features, x_crop])
-        x = merged_dense(merged)
-        x = dropout_layer(x)
-        preds = output_dense(x)
+        # SuperConformer Base returns a list [features, bypass], CvT returns just features
+        if is_conformer:
+            target_out = target_tuple[0]
+            img_features = target_tuple[1][0]
+            bypass_features = target_tuple[1][1]
+            
+            crop_dense = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dense) and l.units == 192)
+            crop_ln = next(l for l in model.layers if isinstance(l, tf.keras.layers.LayerNormalization))
+            crop_reshape = next(l for l in model.layers if isinstance(l, tf.keras.layers.Reshape) and l.target_shape == (1, 192))
+            
+            add_layer = model.get_layer("augmented_features_add")
+            mha_layer = model.get_layer("crop_conditioned_attention")
+            
+            decoder_ln = model.get_layer("decoder_ln")
+            decoder_mlp_1 = model.get_layer("decoder_mlp_1")
+            decoder_mlp_2 = model.get_layer("decoder_mlp_2")
+            decoder_residual_add = model.get_layer("decoder_residual_add")
+            
+            reshape_merged = model.get_layer("reshape_merged")
+            pure_bypass_gap = model.get_layer("pure_bypass_gap")
+            superhighway_add = model.get_layer("superhighway_add")
+            
+            final_dropout = model.get_layer("final_dropout")
+            output_dense = model.get_layer("disease_output")
+            
+            x_crop = crop_dense(crop_input)
+            x_crop = crop_ln(x_crop)
+            x_crop = crop_reshape(x_crop)
+            
+            augmented = add_layer([img_features, bypass_features])
+            attention_out = mha_layer(query=x_crop, value=augmented, key=augmented)
+            
+            # Decoder
+            mlp_in = decoder_ln(attention_out)
+            mlp_mid = decoder_mlp_1(mlp_in)
+            mlp_out = decoder_mlp_2(mlp_mid)
+            attention_out = decoder_residual_add([attention_out, mlp_out])
+            
+            merged = reshape_merged(attention_out)
+            
+            # Superhighway
+            pure_bypass = pure_bypass_gap(bypass_features)
+            merged = superhighway_add([merged, pure_bypass])
+            
+            x = final_dropout(merged)
+            preds = output_dense(x)
+            
+        else:
+            target_out = target_tuple[0]
+            img_features = target_tuple[1]
+            
+            crop_dense = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dense) and l.units == 192)
+            crop_ln = next(l for l in model.layers if isinstance(l, tf.keras.layers.LayerNormalization))
+            crop_reshape = next(l for l in model.layers if isinstance(l, tf.keras.layers.Reshape))
+            concat_layer = next(l for l in model.layers if isinstance(l, tf.keras.layers.Concatenate))
+            
+            transformer_block = next(l for l in model.layers if "prompt_cross_fusion" in l.name)
+            gap_layer = next(l for l in model.layers if isinstance(l, tf.keras.layers.GlobalAveragePooling1D))
+            dropout_layer = next(l for l in model.layers if isinstance(l, tf.keras.layers.Dropout))
+            output_dense = model.get_layer("disease_output")
+            
+            x_crop = crop_dense(crop_input)
+            x_crop = crop_ln(x_crop)
+            x_crop = crop_reshape(x_crop)
+            merged = concat_layer([x_crop, img_features])
+            
+            x = transformer_block(merged)
+            x = gap_layer(x)
+            x = dropout_layer(x)
+            preds = output_dense(x)
         
         grad_model = tf.keras.Model(inputs=[image_input, crop_input], outputs=[target_out, preds])
         

@@ -60,13 +60,31 @@ def plot_history(history, model_name, seed, save_dir="results"):
 def plot_confusion_matrix(y_true, y_pred, classes, model_name, seed, save_dir="results"):
     os.makedirs(save_dir, exist_ok=True)
     cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
-    plt.title(f'{model_name} (Seed {seed}) - Confusion Matrix')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.savefig(os.path.join(save_dir, f"{model_name}_seed{seed}_confusion_matrix.png"))
+    n = len(classes)
+    
+    # Dynamic scaling: 17 classes * 1.0 = 17x17 inches
+    fig_size = max(10, n * 1.0)
+    plt.figure(figsize=(fig_size, fig_size))
+    
+    # Adjust font size based on number of classes
+    font_scale = 1.0 if n < 10 else 0.8 if n < 20 else 0.6
+    sns.set(font_scale=font_scale)
+    
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes, cbar=False)
+    plt.title(f'{model_name} (Seed {seed}) - Confusion Matrix', fontsize=16)
+    plt.ylabel('True Label', fontsize=14)
+    plt.xlabel('Predicted Label', fontsize=14)
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    
+    # Force layout to respect labels
+    plt.tight_layout()
+    
+    save_path = os.path.join(save_dir, f"{model_name}_seed42_confusion_matrix.png" if "seed" not in str(seed) else f"{model_name}_seed{seed}_confusion_matrix.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
+    # Reset sns font scale for other plots
+    sns.set(font_scale=1.0)
 
 def calculate_metrics(y_true, y_pred):
     acc = accuracy_score(y_true, y_pred)

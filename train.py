@@ -11,7 +11,6 @@ from models import get_model
 from data_loader import get_data_generators, get_dummy_dataset
 from metrics_utils import get_flops, plot_history, plot_confusion_matrix, calculate_metrics
 from explainability import generate_explainability
-from sklearn.utils.class_weight import compute_class_weight
 
 def set_seed(seed):
     random.seed(seed)
@@ -29,7 +28,7 @@ def main():
     parser.add_argument("--max_per_class", type=int, default=None, help="Max images per class (default: use all images)")
     args = parser.parse_args()
 
-    available_models = ["ResNet50", "EfficientNetB0", "MobileNetV2", "ViT", "SwinTiny", "CvT"]
+    available_models = ["ResNet50", "EfficientNetB0", "MobileNetV2", "ViT", "SwinTiny", "CvT", "Conformer"]
     if args.model == "all":
         models_to_run = available_models
     else:
@@ -82,7 +81,7 @@ def main():
             model = get_model(model_name, input_shape, num_classes)
             
             optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-4)
-            model.compile(optimizer=optimizer, loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1), metrics=["accuracy"])
+            model.compile(optimizer=optimizer, loss="categorical_crossentropy", metrics=["accuracy"])
 
             # Data Loading
             if args.dummy:
@@ -99,17 +98,6 @@ def main():
             params = model.count_params()
             flops = get_flops(model)
             
-            # Compute class weights for handling imbalance
-            if args.dummy:
-                class_weight_dict = None
-            else:
-                class_weights = compute_class_weight(
-                    'balanced',
-                    classes=np.unique(train_gen.classes),
-                    y=train_gen.classes
-                )
-                class_weight_dict = dict(enumerate(class_weights))
-
             # Callbacks
             callbacks = [
                 tf.keras.callbacks.ReduceLROnPlateau(
@@ -129,7 +117,6 @@ def main():
                 steps_per_epoch=steps_per_epoch,
                 validation_steps=val_steps,
                 callbacks=callbacks,
-                class_weight=class_weight_dict,
                 verbose=1
             )
             train_time = time.time() - start_train
