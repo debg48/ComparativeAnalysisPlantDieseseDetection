@@ -43,12 +43,12 @@ python3 train_hierarchical.py --model Conformer --batch_size 8
 ## Structure
 
 - `models.py`: Network construction for all architectures, including the **SuperConformer** and **Dual-Input** logic.
-- `train_hierarchical.py`: Orchestrator for the Two-Stage system (Router + Joint Specialist).
+- `train.py`: Standard single-phase training pipeline with data augmentation, label smoothing, and callbacks.
+- `train_hierarchical.py`: Orchestrator for the Two-Stage system (Router + Joint Specialist) with prediction masking.
+- `data_loader.py` & `hierarchical_data_loader.py`: Dataset loading and preprocessing pipelines.
 - `explainability.py`: Grad-CAM extraction with native support for dual-input conditioning.
 - `metrics_utils.py`: Analytical engines evaluating runtime, matrices, and FLOPs.
+- `compare_results.py`: Tools for comparative evaluation of performance metrics across all architectures.
+- `generate_experiments_report.py`: Automated generation of detailed markdown experiment reports.
+- `plot_single_phase_accuracy.py` & `plot_model_parameters.py`: Visualization scripts for benchmarking and analysis.
 
-## Accomplishments
-
-- [x] **Hybrid RoPE Implementation**: Integrated Rotary Positional Embeddings into the CvT backbone.
-- [x] **Dynamic Fusion Overhaul**: Replaced SE gating with Dynamic Cross-Attention to prevent overfitting on low-data classes.
-- [x] **Multi-Scale Mixing**: Implemented dual-branch patch extraction for Rice/Sugarcane texture resolution.
